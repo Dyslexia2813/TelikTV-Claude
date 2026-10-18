@@ -12,12 +12,17 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.net.http.SslError;
+import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.SslErrorHandler;
 import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
@@ -27,6 +32,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.TextView;
 
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
@@ -41,10 +47,25 @@ import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.KeyStore;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 
 /**
  * The whole app is this one screen.
@@ -52,6 +73,8 @@ import java.util.Set;
  * 1. If a stream link from the previous run is cached, play it right away with the native player.
  * 2. Otherwise (or if it fails) open the page in an invisible-UI WebView, catch the .m3u8 request the
  *    page's own player makes, then close the WebView and play that link with the native hardware player.
+ *    In parallel the page HTML (and its player iframes) is fetched directly and searched for an .m3u8 link,
+ *    which works even when the box's built-in browser is too old to run the page's scripts.
  * 3. If no link shows up, the page itself stays on screen with everything except the video hidden.
  *
  * Errors, stalls and network loss restart the stream automatically.
@@ -84,6 +107,19 @@ public class MainActivity extends Activity {
     private boolean started;
     private ConnectivityManager.NetworkCallback netCallback;
     private boolean netLost;
+    private boolean sniffing;
+    private int scrapeGen;
+    private String defaultUa;
+
+    // Diagnostics: shown in a corner only when nothing has played for a while.
+    private static final long DIAG_DELAY_MS = 15_000;
+    private TextView diag;
+    private boolean playingOk;
+    private boolean diagHidden;
+    private long notPlayingSince;
+    private String stage = "старт";
+    private String lastError = "-";
+    private static volatile String tlsProblem;
 
     // ---------------------------------------------------------------- lifecycle
 
@@ -99,6 +135,22 @@ public class MainActivity extends Activity {
         setContentView(root);
         hideSystemUi();
 
+        diag = new TextView(this);
+        diag.setTextColor(0xFFAAAAAA);
+        diag.setBackgroundColor(0xAA000000);
+        diag.setTextSize(12);
+        diag.setPadding(16, 8, 16, 8);
+        diag.setVisibility(View.GONE);
+        root.addView(diag, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START));
+
+        installLenientTls();
+        try {
+            defaultUa = WebSettings.getDefaultUserAgent(this);
+        } catch (RuntimeException e) {
+            defaultUa = null;
+        }
+
         loadCachedStream();
     }
 
@@ -106,6 +158,8 @@ public class MainActivity extends Activity {
     protected void onStart() {
         super.onStart();
         started = true;
+        setPlaying(false);
+        main.postDelayed(diagLoop, 3_000);
         registerNetworkCallback();
         if (streamUrl != null) {
             startPlayer();
@@ -147,6 +201,12 @@ public class MainActivity extends Activity {
                 }
                 return super.onKeyDown(keyCode, event);
             case KeyEvent.KEYCODE_MENU:
+            case KeyEvent.KEYCODE_INFO:
+                // Show/hide the diagnostics line.
+                diagHidden = !diagHidden;
+                if (diagHidden) diag.setVisibility(View.GONE);
+                else showDiag();
+                return true;
             case KeyEvent.KEYCODE_SEARCH:
                 return true;
             default:
@@ -169,8 +229,11 @@ public class MainActivity extends Activity {
 
     private void startPlayer() {
         if (!started || streamUrl == null) return;
+        sniffing = false;
+        scrapeGen++;
         destroyWebView();
         releasePlayer();
+        stage = "плеер: подключение к потоку";
 
         if (surface == null) {
             surface = new SurfaceView(this);
@@ -178,6 +241,7 @@ public class MainActivity extends Activity {
         }
 
         String ua = streamHeaders.get("User-Agent");
+        if (ua == null) ua = defaultUa;
         Map<String, String> extra = new HashMap<>(streamHeaders);
         extra.remove("User-Agent");
         String cookies = CookieManager.getInstance().getCookie(streamUrl);
@@ -225,8 +289,12 @@ public class MainActivity extends Activity {
             main.removeCallbacks(stallCheck);
             if (state == Player.STATE_READY) {
                 failCount = 0;
+                stage = "плеер: воспроизведение";
+                setPlaying(true);
                 saveCachedStream();
             } else if (state == Player.STATE_BUFFERING) {
+                stage = "плеер: буферизация";
+                setPlaying(false);
                 main.postDelayed(stallCheck, STALL_TIMEOUT_MS);
             } else if (state == Player.STATE_ENDED) {
                 // A live stream never ends: this link was probably an ad or a preview. Find another.
@@ -243,6 +311,9 @@ public class MainActivity extends Activity {
         @Override
         public void onPlayerError(PlaybackException error) {
             main.removeCallbacks(stallCheck);
+            setPlaying(false);
+            Throwable c = error.getCause();
+            noteError("плеер " + error.getErrorCodeName() + (c != null ? ": " + c : ""));
             if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW && player != null) {
                 player.seekToDefaultPosition();
                 player.prepare();
@@ -262,6 +333,7 @@ public class MainActivity extends Activity {
 
     private final Runnable stallCheck = () -> {
         if (player != null && player.getPlaybackState() == Player.STATE_BUFFERING) {
+            noteError("поток завис в буферизации");
             failCount++;
             if (failCount > MAX_RETRIES_SAME_URL) {
                 forgetStream(false);
@@ -323,13 +395,24 @@ public class MainActivity extends Activity {
     private void startSniffing() {
         if (!started) return;
         releasePlayer();
+        setPlaying(false);
+        sniffing = true;
+        stage = "поиск ссылки на поток";
         if (surface != null) {
             root.removeView(surface);
             surface = null;
         }
+        scrapeAsync();
 
         if (web == null) {
-            web = new WebView(this);
+            try {
+                web = new WebView(this);
+            } catch (RuntimeException e) {
+                // No usable system WebView on this box: rely on the HTML search only.
+                noteError("WebView не создаётся: " + e);
+                main.postDelayed(MainActivity.this::retrySniffIfIdle, 20_000);
+                return;
+            }
             web.setBackgroundColor(Color.BLACK);
             web.setVerticalScrollBarEnabled(false);
             web.setHorizontalScrollBarEnabled(false);
@@ -351,14 +434,23 @@ public class MainActivity extends Activity {
             CookieManager.getInstance().setAcceptCookie(true);
             CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
 
+            web.addJavascriptInterface(new JsBridge(), "TK");
             web.setWebViewClient(webClient);
             web.setWebChromeClient(new WebChromeClient() {
                 @Override
                 public View getVideoLoadingProgressView() {
                     return new View(MainActivity.this);
                 }
+
+                @Override
+                public boolean onConsoleMessage(ConsoleMessage m) {
+                    if (m.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                        noteError("JS: " + m.message() + " @" + m.lineNumber());
+                    }
+                    return true;
+                }
             });
-            root.addView(web, matchParent());
+            root.addView(web, 0, matchParent());
         }
         web.loadUrl(PAGE_URL);
         main.removeCallbacks(injectLoop);
@@ -389,24 +481,39 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            // Old boxes often have outdated root certificates or a wrong clock. This app only shows a public
+            // video page, so accept the certificate rather than show nothing.
+            noteError("SSL " + error.getPrimaryError() + " " + error.getUrl());
+            handler.proceed();
+        }
+
+        @Override
         public void onPageFinished(WebView view, String url) {
             injectFullscreenVideo();
         }
 
         @Override
         public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-            if (request.isForMainFrame()) schedulePageReload();
+            if (request.isForMainFrame()) {
+                noteError("страница: " + error.getErrorCode() + " " + error.getDescription());
+                schedulePageReload();
+            }
         }
 
         @Override
         @SuppressWarnings("deprecation")
         public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
-            if (Build.VERSION.SDK_INT < 23) schedulePageReload();
+            if (Build.VERSION.SDK_INT < 23) {
+                noteError("страница: " + errorCode + " " + description);
+                schedulePageReload();
+            }
         }
 
         @Override
         public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
             // WebView crashed or was killed for memory: rebuild it instead of crashing the app.
+            noteError("WebView упал");
             destroyWebView();
             main.postDelayed(MainActivity.this::startSniffing, PAGE_RETRY_MS);
             return true;
@@ -414,7 +521,7 @@ public class MainActivity extends Activity {
     };
 
     private void onStreamFound(String url, Map<String, String> headers) {
-        if (!started || web == null || badUrls.contains(url)) return;
+        if (!started || !sniffing || badUrls.contains(url)) return;
         streamUrl = url;
         streamHeaders = headers;
         failCount = 0;
@@ -468,6 +575,7 @@ public class MainActivity extends Activity {
             + "p.style.contain='none';p.style.willChange='auto';}}"
             + "if(t&&t.tagName==='VIDEO'){t.controls=false;if(t.paused){var pr=t.play();"
             + "if(pr&&pr.catch)pr.catch(function(){t.muted=true;t.play();});}}"
+            + "if(window.TK)TK.playing(!!(t&&t.tagName==='VIDEO'&&!t.paused&&t.readyState>2),t?t.tagName:'');"
             + "}catch(e){}})();";
 
     private void destroyWebView() {
@@ -512,6 +620,193 @@ public class MainActivity extends Activity {
             else if (lk.equals("authorization")) out.put("Authorization", e.getValue());
         }
         return out;
+    }
+
+    private void retrySniffIfIdle() {
+        if (started && sniffing && player == null) startSniffing();
+    }
+
+    /** Called from the injected page script (WebView fallback mode). */
+    private final class JsBridge {
+        @JavascriptInterface
+        public void playing(boolean isPlaying, String what) {
+            main.post(() -> {
+                if (!sniffing) return;
+                stage = "страница: " + (what == null || what.isEmpty() ? "видео не найдено" : what);
+                setPlaying(isPlaying);
+            });
+        }
+    }
+
+    // ---------------------------------------------------------------- direct HTML search (no JS needed)
+
+    private static final Pattern M3U8 = Pattern.compile(
+            "(?:https?:)?//[^\"'\\s<>()\\\\]+?\\.m3u8[^\"'\\s<>()\\\\]*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern IFRAME = Pattern.compile(
+            "<iframe[^>]+?src\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
+
+    private void scrapeAsync() {
+        final int gen = ++scrapeGen;
+        final String ua = defaultUa;
+        Thread t = new Thread(() -> {
+            String[] found = null;
+            try {
+                found = scrape(PAGE_URL, null, ua, 0);
+            } catch (Exception e) {
+                final String msg = "HTML: " + e;
+                main.post(() -> noteError(msg));
+            }
+            if (found == null) return;
+            final String url = found[0];
+            final String referer = found[1];
+            main.post(() -> {
+                if (gen != scrapeGen) return;
+                Map<String, String> h = new HashMap<>();
+                h.put("Referer", referer);
+                Uri r = Uri.parse(referer);
+                h.put("Origin", r.getScheme() + "://" + r.getHost());
+                if (ua != null) h.put("User-Agent", ua);
+                onStreamFound(url, h);
+            });
+        }, "scrape");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Returns {streamUrl, pageItWasFoundOn} or null. Follows player iframes two levels deep. */
+    private String[] scrape(String pageUrl, String referer, String ua, int depth) throws Exception {
+        String html = fetch(pageUrl, referer, ua).replace("\\/", "/");
+        Matcher m = M3U8.matcher(html);
+        while (m.find()) {
+            String u = resolve(pageUrl, m.group());
+            if (!badUrls.contains(u)) return new String[]{u, pageUrl};
+        }
+        if (depth >= 2) return null;
+        Matcher f = IFRAME.matcher(html);
+        while (f.find()) {
+            String child = resolve(pageUrl, f.group(1).replace("&amp;", "&"));
+            if (!child.startsWith("http")) continue;
+            try {
+                String[] r = scrape(child, pageUrl, ua, depth + 1);
+                if (r != null) return r;
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static String resolve(String base, String url) throws Exception {
+        if (url.startsWith("//")) return Uri.parse(base).getScheme() + ":" + url;
+        return new URL(new URL(base), url).toString();
+    }
+
+    private static String fetch(String url, String referer, String ua) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            c.setConnectTimeout(10_000);
+            c.setReadTimeout(10_000);
+            c.setInstanceFollowRedirects(true);
+            if (ua != null) c.setRequestProperty("User-Agent", ua);
+            if (referer != null) c.setRequestProperty("Referer", referer);
+            c.setRequestProperty("Accept", "text/html,*/*");
+            int code = c.getResponseCode();
+            if (code >= 400) throw new java.io.IOException("HTTP " + code + " " + url);
+            InputStream in = c.getInputStream();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0 && out.size() < 3_000_000) out.write(buf, 0, n);
+            return out.toString("UTF-8");
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    /**
+     * Old Android boxes often have outdated root certificates (Let's Encrypt) or a wrong clock, so HTTPS fails
+     * with nothing on screen. Use the normal check, but if it fails, note it and continue anyway: the app only
+     * fetches a public video page and stream, nothing private is sent.
+     */
+    private static void installLenientTls() {
+        try {
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init((KeyStore) null);
+            final X509TrustManager sys = (X509TrustManager) tmf.getTrustManagers()[0];
+            X509TrustManager tm = new X509TrustManager() {
+                @Override
+                public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                    sys.checkClientTrusted(chain, authType);
+                }
+
+                @Override
+                public void checkServerTrusted(X509Certificate[] chain, String authType) {
+                    try {
+                        sys.checkServerTrusted(chain, authType);
+                    } catch (CertificateException e) {
+                        tlsProblem = String.valueOf(e.getMessage());
+                    }
+                }
+
+                @Override
+                public X509Certificate[] getAcceptedIssuers() {
+                    return sys.getAcceptedIssuers();
+                }
+            };
+            SSLContext ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, new TrustManager[]{tm}, null);
+            HttpsURLConnection.setDefaultSSLSocketFactory(ctx.getSocketFactory());
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ---------------------------------------------------------------- diagnostics
+
+    private void setPlaying(boolean ok) {
+        if (ok == playingOk && (ok || notPlayingSince != 0)) return;
+        playingOk = ok;
+        if (ok) {
+            notPlayingSince = 0;
+            diag.setVisibility(View.GONE);
+        } else {
+            notPlayingSince = System.currentTimeMillis();
+        }
+    }
+
+    private void noteError(String e) {
+        lastError = e.length() > 300 ? e.substring(0, 300) : e;
+        if (diag.getVisibility() == View.VISIBLE) showDiag();
+    }
+
+    private final Runnable diagLoop = new Runnable() {
+        @Override
+        public void run() {
+            if (!started) return;
+            if (!playingOk && !diagHidden && notPlayingSince != 0
+                    && System.currentTimeMillis() - notPlayingSince > DIAG_DELAY_MS) {
+                showDiag();
+            }
+            main.postDelayed(this, 3_000);
+        }
+    };
+
+    private void showDiag() {
+        String chrome = "?";
+        if (defaultUa != null) {
+            Matcher m = Pattern.compile("Chrome/([\\d.]+)").matcher(defaultUa);
+            if (m.find()) chrome = m.group(1);
+        }
+        String url = streamUrl == null ? "-" : (streamUrl.length() > 120 ? streamUrl.substring(0, 120) + "…" : streamUrl);
+        String text = "TelikTV " + BuildConfig.VERSION_NAME
+                + " · Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
+                + " · WebView " + chrome
+                + "\nЭтап: " + stage
+                + "\nОшибка: " + lastError
+                + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
+                + "\nСсылка: " + url
+                + "\n(кнопка Menu скрывает эту надпись)";
+        diag.setText(text);
+        diag.setVisibility(View.VISIBLE);
+        diag.bringToFront();
     }
 
     // ---------------------------------------------------------------- cached link

@@ -10,8 +10,8 @@ android {
         applicationId 'tv.telik.app'
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
         // Only keep resources we actually ship (no extra translations from libraries).
         resourceConfigurations += ['ru', 'en']
     }
@@ -37,6 +37,10 @@ android {
         debug {
             signingConfig signingConfigs.release
         }
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {
