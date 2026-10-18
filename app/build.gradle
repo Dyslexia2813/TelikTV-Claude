@@ -1,0 +1,68 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'tv.telik.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'tv.telik.app'
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+        // Only keep resources we actually ship (no extra translations from libraries).
+        resourceConfigurations += ['ru', 'en']
+    }
+
+    signingConfigs {
+        release {
+            // Keystore lives in the repo so every CI build has the same signature
+            // and a new APK installs over the old one. Can be overridden by CI secrets.
+            storeFile file(System.getenv('SIGNING_STORE_FILE') ?: 'release.keystore')
+            storePassword System.getenv('SIGNING_STORE_PASSWORD') ?: 'teliktv'
+            keyAlias System.getenv('SIGNING_KEY_ALIAS') ?: 'teliktv'
+            keyPassword System.getenv('SIGNING_KEY_PASSWORD') ?: 'teliktv'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+        debug {
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    dependenciesInfo {
+        includeInApk false
+        includeInBundle false
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/**', 'kotlin/**', '**/*.kotlin_builtins', '**/*.version']
+        }
+    }
+}
+
+dependencies {
+    // Only the player core + HLS. No UI module, no AppCompat, no Kotlin.
+    implementation 'androidx.media3:media3-exoplayer:1.4.1'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.4.1'
+}
