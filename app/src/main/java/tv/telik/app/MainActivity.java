@@ -266,13 +266,17 @@ public class MainActivity extends Activity {
 
         // Small buffers: low RAM use on a weak box, fast start.
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-                .setBufferDurationsMs(10_000, 30_000, 1_500, 3_000)
+                .setBufferDurationsMs(15_000, 30_000, 2_000, 4_000)
                 .build();
 
-        // The box outputs 1080p at best; never pick a heavier variant than that.
+        // Always the best quality the stream offers, up to 1080p (the box can't output more).
+        // By default the player would limit itself to the screen size the box reports (often 720p)
+        // and start from a low quality, which looks worse than the site.
         DefaultTrackSelector trackSelector = new DefaultTrackSelector(this);
         trackSelector.setParameters(trackSelector.buildUponParameters()
+                .clearViewportSizeConstraints()
                 .setMaxVideoSize(1920, 1080)
+                .setForceHighestSupportedBitrate(true)
                 .setExceedRendererCapabilitiesIfNecessary(true));
 
         // Hardware MediaCodec decoders; fall back to another decoder if the first one fails.
