@@ -121,6 +121,8 @@ public class MainActivity extends Activity {
     private boolean netLost;
     private boolean sniffing;
     private static boolean strictDecoder;
+    private static boolean tunnelingOff;
+    private boolean firstFrame;
     private DefaultBandwidthMeter bandwidth;
     private int scrapeGen;
     private String defaultUa;
@@ -295,6 +297,10 @@ public class MainActivity extends Activity {
                 .setExceedRendererCapabilitiesIfNecessary(true);
         if (strictDecoder) params.setMaxVideoSize(1920, 1080);
         else params.clearVideoSizeConstraints();
+        // Tunneled playback: the decoder draws straight onto the TV's video plane at full resolution,
+        // bypassing the (often 720p) interface layer. Turned off automatically if the box mishandles it.
+        params.setTunnelingEnabled(!tunnelingOff);
+        firstFrame = false;
         trackSelector.setParameters(params);
         // Assume a very fast connection at start so playback begins at the top quality, not the lowest.
         bandwidth = new DefaultBandwidthMeter.Builder(this)
@@ -329,6 +335,10 @@ public class MainActivity extends Activity {
                 failCount = 0;
                 stage = "плеер: воспроизведение";
                 setPlaying(true);
+                if (!tunnelingOff) {
+                    main.removeCallbacks(tunnelCheck);
+                    main.postDelayed(tunnelCheck, 8_000);
+                }
                 saveCachedStream();
             } else if (state == Player.STATE_BUFFERING) {
                 stage = "плеер: буферизация";
@@ -347,6 +357,11 @@ public class MainActivity extends Activity {
         }
 
         @Override
+        public void onRenderedFirstFrame() {
+            firstFrame = true;
+        }
+
+        @Override
         public void onPlayerError(PlaybackException error) {
             main.removeCallbacks(stallCheck);
             setPlaying(false);
@@ -355,6 +370,12 @@ public class MainActivity extends Activity {
             if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW && player != null) {
                 player.seekToDefaultPosition();
                 player.prepare();
+                return;
+            }
+            if (!tunnelingOff && isDecoderError(error)) {
+                // First suspect: tunneled playback. Retry without it.
+                tunnelingOff = true;
+                main.postDelayed(MainActivity.this::startPlayer, 1_000);
                 return;
             }
             if (!strictDecoder && isDecoderError(error)) {
@@ -439,6 +460,15 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Playing but no picture came out in tunneled mode: this box doesn't handle it, switch it off. */
+    private final Runnable tunnelCheck = () -> {
+        if (player != null && !firstFrame && !tunnelingOff) {
+            tunnelingOff = true;
+            noteError("тоннельный режим: нет картинки, выключен");
+            startPlayer();
+        }
+    };
+
     private static boolean isDecoderError(PlaybackException e) {
         int c = e.errorCode;
         return c == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
@@ -472,6 +502,13 @@ public class MainActivity extends Activity {
         }
         if (bandwidth != null) sb.append(" · сеть ").append(bandwidth.getBitrateEstimate() / 1000).append(" кбит/с");
         if (strictDecoder) sb.append(" · осторожный режим");
+        sb.append(tunnelingOff ? " · тоннель выкл" : " · тоннель вкл");
+        sb.append("\nЭкран: интерфейс ").append(root.getWidth()).append('x').append(root.getHeight());
+        if (Build.VERSION.SDK_INT >= 23) {
+            android.view.Display.Mode mode = getWindowManager().getDefaultDisplay().getMode();
+            sb.append(", выход на ТВ ").append(mode.getPhysicalWidth()).append('x').append(mode.getPhysicalHeight())
+                    .append(" ").append(Math.round(mode.getRefreshRate())).append("Гц");
+        }
         return sb.toString();
     }
 
@@ -498,6 +535,7 @@ public class MainActivity extends Activity {
 
     private void releasePlayer() {
         main.removeCallbacks(stallCheck);
+        main.removeCallbacks(tunnelCheck);
         if (player != null) {
             player.removeListener(playerListener);
             player.release();
