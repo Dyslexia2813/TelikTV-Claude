@@ -580,6 +580,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** The real HDMI output mode: Amlogic keeps it in sysfs files or system properties, depending on firmware. */
+    private static String hdmiMode() {
+        String[] files = {"/sys/class/display/mode", "/sys/class/amhdmitx/amhdmitx0/disp_mode"};
+        for (String f : files) {
+            String v = readSys(f);
+            if (v != null && !v.isEmpty()) return v;
+        }
+        String[] props = {"ubootenv.var.outputmode", "persist.sys.hdmimode", "sys.hdmi.mode",
+                "persist.vendor.hdmi.mode", "ubootenv.var.hdmimode", "persist.sys.outputmode"};
+        try {
+            java.lang.reflect.Method get = Class.forName("android.os.SystemProperties").getMethod("get", String.class);
+            for (String k : props) {
+                String v = (String) get.invoke(null, k);
+                if (v != null && !v.isEmpty()) return v + " (" + k + ")";
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private static boolean isDecoderError(PlaybackException e) {
         int c = e.errorCode;
         return c == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
@@ -614,7 +634,7 @@ public class MainActivity extends Activity {
         if (bandwidth != null) sb.append(" · сеть ").append(bandwidth.getBitrateEstimate() / 1000).append(" кбит/с");
         if (strictDecoder) sb.append(" · осторожный режим");
         sb.append(tunnelingOff ? " · тоннель выкл" : " · тоннель вкл");
-        String hdmi = readSys("/sys/class/display/mode");
+        String hdmi = hdmiMode();
         sb.append("\nЭкран: HDMI ").append(hdmi != null ? hdmi : "?");
         sb.append(" · интерфейс ").append(root.getWidth()).append('x').append(root.getHeight());
         if (Build.VERSION.SDK_INT >= 23) {
