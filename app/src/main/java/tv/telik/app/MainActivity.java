@@ -47,6 +47,7 @@ import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -56,6 +57,8 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -118,7 +121,10 @@ public class MainActivity extends Activity {
     private boolean diagHidden;
     private long notPlayingSince;
     private String stage = "старт";
-    private String lastError = "-";
+    private final LinkedList<String> lastErrors = new LinkedList<>();
+    private volatile String frameSrc = "-";
+    private volatile int patchedPages;
+    private volatile byte[] polyfill;
     private static volatile String tlsProblem;
 
     // ---------------------------------------------------------------- lifecycle
@@ -202,6 +208,7 @@ public class MainActivity extends Activity {
                 return super.onKeyDown(keyCode, event);
             case KeyEvent.KEYCODE_MENU:
             case KeyEvent.KEYCODE_INFO:
+            case KeyEvent.KEYCODE_DPAD_UP:
                 // Show/hide the diagnostics line.
                 diagHidden = !diagHidden;
                 if (diagHidden) diag.setVisibility(View.GONE);
@@ -465,6 +472,15 @@ public class MainActivity extends Activity {
             if (isStreamUrl(url)) {
                 final Map<String, String> headers = pickHeaders(request.getRequestHeaders());
                 main.post(() -> onStreamFound(url, headers));
+                return null;
+            }
+            if (wantsHtml(request)) {
+                // Page or player frame: add the missing-functions script before the site's own scripts run.
+                try {
+                    return fetchHtmlWithPolyfill(url, request.getRequestHeaders());
+                } catch (Exception e) {
+                    return null; // let the WebView load it normally
+                }
             }
             return null;
         }
@@ -575,7 +591,7 @@ public class MainActivity extends Activity {
             + "p.style.contain='none';p.style.willChange='auto';}}"
             + "if(t&&t.tagName==='VIDEO'){t.controls=false;if(t.paused){var pr=t.play();"
             + "if(pr&&pr.catch)pr.catch(function(){t.muted=true;t.play();});}}"
-            + "if(window.TK)TK.playing(!!(t&&t.tagName==='VIDEO'&&!t.paused&&t.readyState>2),t?t.tagName:'');"
+            + "if(window.TK)TK.playing(!!(t&&t.tagName==='VIDEO'&&!t.paused&&t.readyState>2),t?t.tagName:'',t?(t.currentSrc||t.src||''):'');"
             + "}catch(e){}})();";
 
     private void destroyWebView() {
@@ -629,19 +645,120 @@ public class MainActivity extends Activity {
     /** Called from the injected page script (WebView fallback mode). */
     private final class JsBridge {
         @JavascriptInterface
-        public void playing(boolean isPlaying, String what) {
+        public void playing(boolean isPlaying, String what, String src) {
             main.post(() -> {
                 if (!sniffing) return;
                 stage = "страница: " + (what == null || what.isEmpty() ? "видео не найдено" : what);
+                if (src != null && !src.isEmpty()) frameSrc = src;
                 setPlaying(isPlaying);
             });
         }
+    }
+
+    private static final Pattern HEAD_TAG = Pattern.compile("<head\\b[^>]*>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern HTML_TAG = Pattern.compile("<html\\b[^>]*>", Pattern.CASE_INSENSITIVE);
+
+    private static boolean wantsHtml(WebResourceRequest request) {
+        if (!"GET".equalsIgnoreCase(request.getMethod())) return false;
+        String scheme = request.getUrl().getScheme();
+        if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
+        Map<String, String> h = request.getRequestHeaders();
+        if (h == null) return false;
+        for (Map.Entry<String, String> e : h.entrySet()) {
+            if ("accept".equalsIgnoreCase(e.getKey())) {
+                return e.getValue() != null && e.getValue().contains("text/html");
+            }
+        }
+        return false;
+    }
+
+    private byte[] polyfillTag() throws Exception {
+        if (polyfill == null) {
+            InputStream in = getAssets().open("polyfill.js");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            out.write("<script>".getBytes("ISO-8859-1"));
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            in.close();
+            out.write("</script>".getBytes("ISO-8859-1"));
+            polyfill = out.toByteArray();
+        }
+        return polyfill;
+    }
+
+    /** Downloads an HTML document itself and inserts the polyfill script right after <head>. */
+    private WebResourceResponse fetchHtmlWithPolyfill(String url, Map<String, String> reqHeaders) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setInstanceFollowRedirects(false);
+        c.setConnectTimeout(15_000);
+        c.setReadTimeout(15_000);
+        if (reqHeaders != null) {
+            for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+                String k = e.getKey();
+                if (k == null || e.getValue() == null) continue;
+                String lk = k.toLowerCase();
+                if (lk.equals("accept-encoding") || lk.equals("range") || lk.equals("host")) continue;
+                c.setRequestProperty(k, e.getValue());
+            }
+        }
+        CookieManager cm = CookieManager.getInstance();
+        String cookie = cm.getCookie(url);
+        if (cookie != null) c.setRequestProperty("Cookie", cookie);
+
+        int code = c.getResponseCode();
+        String type = c.getContentType();
+        if (code != 200 || type == null || !type.toLowerCase().contains("text/html")) {
+            // Redirects, errors and non-HTML are left to the WebView itself.
+            c.disconnect();
+            return null;
+        }
+        for (Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
+            if (e.getKey() != null && e.getKey().equalsIgnoreCase("set-cookie")) {
+                for (String v : e.getValue()) cm.setCookie(url, v);
+            }
+        }
+        String charset = null;
+        Matcher cs = Pattern.compile("charset=([\\w-]+)", Pattern.CASE_INSENSITIVE).matcher(type);
+        if (cs.find()) charset = cs.group(1);
+
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        InputStream in = c.getInputStream();
+        byte[] buf = new byte[16384];
+        int n;
+        while ((n = in.read(buf)) > 0) body.write(buf, 0, n);
+        c.disconnect();
+        byte[] bytes = body.toByteArray();
+
+        // Work on bytes (Latin-1 maps 1:1) so the page's own encoding is never touched.
+        String latin = new String(bytes, "ISO-8859-1");
+        int at = 0;
+        Matcher m = HEAD_TAG.matcher(latin);
+        if (m.find()) {
+            at = m.end();
+        } else {
+            m = HTML_TAG.matcher(latin);
+            if (m.find()) at = m.end();
+        }
+        byte[] tag = polyfillTag();
+        ByteArrayOutputStream out = new ByteArrayOutputStream(bytes.length + tag.length);
+        out.write(bytes, 0, at);
+        out.write(tag);
+        out.write(bytes, at, bytes.length - at);
+        patchedPages++;
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Cache-Control", "no-cache");
+        return new WebResourceResponse("text/html", charset, 200, "OK", headers,
+                new ByteArrayInputStream(out.toByteArray()));
     }
 
     // ---------------------------------------------------------------- direct HTML search (no JS needed)
 
     private static final Pattern M3U8 = Pattern.compile(
             "(?:https?:)?//[^\"'\\s<>()\\\\]+?\\.m3u8[^\"'\\s<>()\\\\]*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SCRIPT = Pattern.compile(
+            "<script[^>]+?src\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
     private static final Pattern IFRAME = Pattern.compile(
             "<iframe[^>]+?src\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE);
 
@@ -680,6 +797,24 @@ public class MainActivity extends Activity {
         while (m.find()) {
             String u = resolve(pageUrl, m.group());
             if (!badUrls.contains(u)) return new String[]{u, pageUrl};
+        }
+        // Player settings often live in a separate script file.
+        Matcher sc = SCRIPT.matcher(html);
+        int scripts = 0;
+        while (sc.find() && scripts < 6) {
+            String src = resolve(pageUrl, sc.group(1).replace("&amp;", "&"));
+            String ls = src.toLowerCase();
+            if (!ls.startsWith("http") || ls.contains("jquery") || ls.contains("google") || ls.contains("yandex")
+                    || ls.contains("metrika") || ls.contains("liveinternet") || ls.contains("counter")) continue;
+            scripts++;
+            try {
+                Matcher sm = M3U8.matcher(fetch(src, pageUrl, ua).replace("\\/", "/"));
+                while (sm.find()) {
+                    String u = resolve(pageUrl, sm.group());
+                    if (!badUrls.contains(u)) return new String[]{u, pageUrl};
+                }
+            } catch (Exception ignored) {
+            }
         }
         if (depth >= 2) return null;
         Matcher f = IFRAME.matcher(html);
@@ -773,7 +908,10 @@ public class MainActivity extends Activity {
     }
 
     private void noteError(String e) {
-        lastError = e.length() > 300 ? e.substring(0, 300) : e;
+        if (e.length() > 200) e = e.substring(0, 200);
+        lastErrors.remove(e);
+        lastErrors.addFirst(e);
+        while (lastErrors.size() > 3) lastErrors.removeLast();
         if (diag.getVisibility() == View.VISIBLE) showDiag();
     }
 
@@ -800,10 +938,12 @@ public class MainActivity extends Activity {
                 + " · Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
                 + " · WebView " + chrome
                 + "\nЭтап: " + stage
-                + "\nОшибка: " + lastError
+                + "\nОшибки: " + (lastErrors.isEmpty() ? "-" : android.text.TextUtils.join("\n   ", lastErrors))
+                + "\nПлеер сайта: " + (frameSrc.length() > 120 ? frameSrc.substring(0, 120) + "…" : frameSrc)
+                + " · исправлено страниц: " + patchedPages
                 + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
                 + "\nСсылка: " + url
-                + "\n(кнопка Menu скрывает эту надпись)";
+                + "\n(кнопка Menu или Вверх скрывает/показывает эту надпись)";
         diag.setText(text);
         diag.setVisibility(View.VISIBLE);
         diag.bringToFront();
