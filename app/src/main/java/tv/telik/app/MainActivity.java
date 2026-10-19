@@ -55,6 +55,7 @@ import java.net.URL;
 import java.security.KeyStore;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -97,7 +98,7 @@ public class MainActivity extends Activity {
     private static final String KEY_HEADERS = "hdr";
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final Set<String> badUrls = new HashSet<>();
+    private final Set<String> badUrls = java.util.Collections.synchronizedSet(new HashSet<>());
 
     private FrameLayout root;
     private SurfaceView surface;
@@ -125,6 +126,8 @@ public class MainActivity extends Activity {
     private volatile String frameSrc = "-";
     private volatile int patchedPages;
     private volatile byte[] polyfill;
+    private volatile StringBuffer scrapeTrace;
+    private final List<String> altUrls = new ArrayList<>();
     private static volatile String tlsProblem;
 
     // ---------------------------------------------------------------- lifecycle
@@ -328,7 +331,12 @@ public class MainActivity extends Activity {
             }
             failCount++;
             boolean linkRejected = isHttpRejected(error);
-            if (linkRejected || failCount > MAX_RETRIES_SAME_URL) {
+            if ((linkRejected || failCount > MAX_RETRIES_SAME_URL) && !altUrls.isEmpty()) {
+                // Try the backup server of the same stream first.
+                streamUrl = altUrls.remove(0);
+                failCount = 0;
+                main.postDelayed(MainActivity.this::startPlayer, 1_000);
+            } else if (linkRejected || failCount > MAX_RETRIES_SAME_URL) {
                 // Link probably expired: get a fresh one from the page.
                 forgetStream(false);
                 main.postDelayed(MainActivity.this::startSniffing, linkRejected ? 0 : 2_000);
@@ -740,6 +748,17 @@ public class MainActivity extends Activity {
             m = HTML_TAG.matcher(latin);
             if (m.find()) at = m.end();
         }
+        // The WebView loads player frames with the right cookies/referer: look for the stream link right here.
+        final String[] found = findStreams(latin, url);
+        if (found != null) {
+            String ua = null;
+            if (reqHeaders != null) for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+                if ("user-agent".equalsIgnoreCase(e.getKey())) ua = e.getValue();
+            }
+            final String fua = ua != null ? ua : defaultUa;
+            main.post(() -> onStreamsFound(found, fua));
+        }
+
         byte[] tag = polyfillTag();
         ByteArrayOutputStream out = new ByteArrayOutputStream(bytes.length + tag.length);
         out.write(bytes, 0, at);
@@ -765,6 +784,7 @@ public class MainActivity extends Activity {
     private void scrapeAsync() {
         final int gen = ++scrapeGen;
         final String ua = defaultUa;
+        scrapeTrace = new StringBuffer();
         Thread t = new Thread(() -> {
             String[] found = null;
             try {
@@ -774,60 +794,90 @@ public class MainActivity extends Activity {
                 main.post(() -> noteError(msg));
             }
             if (found == null) return;
-            final String url = found[0];
-            final String referer = found[1];
+            final String[] f = found;
             main.post(() -> {
-                if (gen != scrapeGen) return;
-                Map<String, String> h = new HashMap<>();
-                h.put("Referer", referer);
-                Uri r = Uri.parse(referer);
-                h.put("Origin", r.getScheme() + "://" + r.getHost());
-                if (ua != null) h.put("User-Agent", ua);
-                onStreamFound(url, h);
+                if (gen == scrapeGen) onStreamsFound(f, ua);
             });
         }, "scrape");
         t.setDaemon(true);
         t.start();
     }
 
-    /** Returns {streamUrl, pageItWasFoundOn} or null. Follows player iframes two levels deep. */
-    private String[] scrape(String pageUrl, String referer, String ua, int depth) throws Exception {
-        String html = fetch(pageUrl, referer, ua).replace("\\/", "/");
-        Matcher m = M3U8.matcher(html);
+    /** found = {pageItWasFoundOn, url1, url2, ...}. Plays url1, keeps the rest as backups. */
+    private void onStreamsFound(String[] found, String ua) {
+        Map<String, String> h = new HashMap<>();
+        h.put("Referer", found[0]);
+        Uri r = Uri.parse(found[0]);
+        h.put("Origin", r.getScheme() + "://" + r.getHost());
+        if (ua != null) h.put("User-Agent", ua);
+        if (!started || !sniffing) return;
+        altUrls.clear();
+        for (int i = 2; i < found.length; i++) altUrls.add(found[i]);
+        onStreamFound(found[1], h);
+    }
+
+    /** Finds .m3u8 links in a page; " or "-separated backups (Playerjs style) come along too. */
+    private String[] findStreams(String text, String pageUrl) {
+        text = text.replace("\\/", "/");
+        List<String> out = new ArrayList<>();
+        out.add(pageUrl);
+        Matcher m = M3U8.matcher(text);
         while (m.find()) {
-            String u = resolve(pageUrl, m.group());
-            if (!badUrls.contains(u)) return new String[]{u, pageUrl};
-        }
-        // Player settings often live in a separate script file.
-        Matcher sc = SCRIPT.matcher(html);
-        int scripts = 0;
-        while (sc.find() && scripts < 6) {
-            String src = resolve(pageUrl, sc.group(1).replace("&amp;", "&"));
-            String ls = src.toLowerCase();
-            if (!ls.startsWith("http") || ls.contains("jquery") || ls.contains("google") || ls.contains("yandex")
-                    || ls.contains("metrika") || ls.contains("liveinternet") || ls.contains("counter")) continue;
-            scripts++;
             try {
-                Matcher sm = M3U8.matcher(fetch(src, pageUrl, ua).replace("\\/", "/"));
-                while (sm.find()) {
-                    String u = resolve(pageUrl, sm.group());
-                    if (!badUrls.contains(u)) return new String[]{u, pageUrl};
-                }
+                String u = resolve(pageUrl, m.group());
+                if (!badUrls.contains(u) && !out.contains(u)) out.add(u);
             } catch (Exception ignored) {
             }
         }
-        if (depth >= 2) return null;
-        Matcher f = IFRAME.matcher(html);
-        while (f.find()) {
-            String child = resolve(pageUrl, f.group(1).replace("&amp;", "&"));
-            if (!child.startsWith("http")) continue;
+        return out.size() > 1 ? out.toArray(new String[0]) : null;
+    }
+
+    /** Returns {pageItWasFoundOn, streamUrl, backups...} or null. Follows player iframes three levels deep. */
+    private String[] scrape(String pageUrl, String referer, String ua, int depth) throws Exception {
+        String html;
+        try {
+            html = fetch(pageUrl, referer, ua);
+            trace(Uri.parse(pageUrl).getHost() + " ok");
+        } catch (Exception e) {
+            trace(Uri.parse(pageUrl).getHost() + " " + e.getMessage());
+            throw e;
+        }
+        String[] found = findStreams(html, pageUrl);
+        if (found != null) return found;
+        if (depth < 3) {
+            Matcher f = IFRAME.matcher(html);
+            while (f.find()) {
+                String child = resolve(pageUrl, f.group(1).replace("&amp;", "&"));
+                if (!child.startsWith("http")) continue;
+                try {
+                    String[] r = scrape(child, pageUrl, ua, depth + 1);
+                    if (r != null) return r;
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        // Player settings sometimes live in a separate script file (only on player frames, not the big page).
+        if (depth == 0) return null;
+        Matcher sc = SCRIPT.matcher(html);
+        int scripts = 0;
+        while (sc.find() && scripts < 4) {
+            String src = resolve(pageUrl, sc.group(1).replace("&amp;", "&"));
+            String ls = src.toLowerCase();
+            if (!ls.startsWith("http") || ls.contains("jquery") || ls.contains("google") || ls.contains("yandex")
+                    || ls.contains("gstatic") || ls.contains("counter")) continue;
+            scripts++;
             try {
-                String[] r = scrape(child, pageUrl, ua, depth + 1);
+                String[] r = findStreams(fetch(src, pageUrl, ua), pageUrl);
                 if (r != null) return r;
             } catch (Exception ignored) {
             }
         }
         return null;
+    }
+
+    private void trace(String step) {
+        StringBuffer t = scrapeTrace;
+        if (t != null && t.length() < 300) t.append(t.length() > 0 ? " → " : "").append(step);
     }
 
     private static String resolve(String base, String url) throws Exception {
@@ -942,6 +992,7 @@ public class MainActivity extends Activity {
                 + "\nПлеер сайта: " + (frameSrc.length() > 120 ? frameSrc.substring(0, 120) + "…" : frameSrc)
                 + " · исправлено страниц: " + patchedPages
                 + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
+                + "\nПоиск в HTML: " + (scrapeTrace == null || scrapeTrace.length() == 0 ? "-" : scrapeTrace)
                 + "\nСсылка: " + url
                 + "\n(кнопка Menu или Вверх скрывает/показывает эту надпись)";
         diag.setText(text);
@@ -970,6 +1021,7 @@ public class MainActivity extends Activity {
         streamUrl = null;
         streamHeaders = new HashMap<>();
         failCount = 0;
+        altUrls.clear();
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
     }
 
