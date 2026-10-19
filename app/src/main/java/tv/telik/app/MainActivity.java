@@ -156,6 +156,7 @@ public class MainActivity extends Activity {
         root.setKeepScreenOn(true);
         setContentView(root);
         hideSystemUi();
+        requestBestDisplayMode();
 
         diag = new TextView(this);
         diag.setTextColor(0xFFAAAAAA);
@@ -240,6 +241,33 @@ public class MainActivity extends Activity {
                 return true;
             default:
                 return super.onKeyDown(keyCode, event);
+        }
+    }
+
+    /**
+     * Ask the box to switch the TV output to its highest resolution (e.g. 1080p instead of 720p),
+     * preferring the current refresh rate. Only works for modes the firmware lists as supported.
+     */
+    private void requestBestDisplayMode() {
+        if (Build.VERSION.SDK_INT < 23) return;
+        try {
+            android.view.Display d = getWindowManager().getDefaultDisplay();
+            android.view.Display.Mode cur = d.getMode();
+            android.view.Display.Mode best = cur;
+            for (android.view.Display.Mode m : d.getSupportedModes()) {
+                long px = (long) m.getPhysicalWidth() * m.getPhysicalHeight();
+                long bestPx = (long) best.getPhysicalWidth() * best.getPhysicalHeight();
+                if (m.getPhysicalHeight() > 2160) continue;
+                boolean sameRate = Math.abs(m.getRefreshRate() - cur.getRefreshRate()) < 1;
+                boolean bestSameRate = Math.abs(best.getRefreshRate() - cur.getRefreshRate()) < 1;
+                if (px > bestPx || (px == bestPx && sameRate && !bestSameRate)) best = m;
+            }
+            if (best.getModeId() != cur.getModeId()) {
+                WindowManager.LayoutParams lp = getWindow().getAttributes();
+                lp.preferredDisplayModeId = best.getModeId();
+                getWindow().setAttributes(lp);
+            }
+        } catch (RuntimeException ignored) {
         }
     }
 
@@ -508,6 +536,10 @@ public class MainActivity extends Activity {
             android.view.Display.Mode mode = getWindowManager().getDefaultDisplay().getMode();
             sb.append(", выход на ТВ ").append(mode.getPhysicalWidth()).append('x').append(mode.getPhysicalHeight())
                     .append(" ").append(Math.round(mode.getRefreshRate())).append("Гц");
+            sb.append(" · доступно:");
+            for (android.view.Display.Mode m : getWindowManager().getDefaultDisplay().getSupportedModes()) {
+                sb.append(' ').append(m.getPhysicalHeight()).append('p').append(Math.round(m.getRefreshRate()));
+            }
         }
         return sb.toString();
     }
