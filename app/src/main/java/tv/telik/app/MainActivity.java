@@ -338,9 +338,12 @@ public class MainActivity extends Activity {
                 .setDefaultRequestProperties(extra);
         if (ua != null) http.setUserAgent(ua);
 
-        // Small buffers: low RAM use on a weak box, fast start.
+        // Keep a deep reserve so short network dips don't freeze the picture, and after a stall wait for
+        // a proper reserve (8 s) instead of playing 4 s and freezing again. Capped at 64 MB of RAM.
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
-                .setBufferDurationsMs(15_000, 30_000, 2_000, 4_000)
+                .setBufferDurationsMs(30_000, 60_000, 2_000, 8_000)
+                .setTargetBufferBytes(64 * 1024 * 1024)
+                .setPrioritizeTimeOverSizeThresholds(false)
                 .build();
 
         // Adaptive quality up to 1080p (the box can't output more): start at the best quality, step down
@@ -377,7 +380,16 @@ public class MainActivity extends Activity {
                 .build();
         player.setVideoSurfaceView(surface);
         player.addListener(playerListener);
-        player.setMediaItem(MediaItem.fromUri(streamUrl));
+        // Play ~20 s behind the live edge at steady speed (no catching up), so there's always
+        // downloaded video in hand, like the site's player does.
+        player.setMediaItem(new MediaItem.Builder()
+                .setUri(streamUrl)
+                .setLiveConfiguration(new MediaItem.LiveConfiguration.Builder()
+                        .setTargetOffsetMs(20_000)
+                        .setMinPlaybackSpeed(1f)
+                        .setMaxPlaybackSpeed(1f)
+                        .build())
+                .build());
         player.setPlayWhenReady(true);
         player.prepare();
     }
@@ -632,6 +644,11 @@ public class MainActivity extends Activity {
             }
         }
         if (bandwidth != null) sb.append(" · сеть ").append(bandwidth.getBitrateEstimate() / 1000).append(" кбит/с");
+        if (player != null) {
+            sb.append(" · запас ").append(player.getTotalBufferedDuration() / 1000).append(" с");
+            long off = player.getCurrentLiveOffset();
+            if (off != C.TIME_UNSET) sb.append(", от эфира ").append(off / 1000).append(" с");
+        }
         if (strictDecoder) sb.append(" · осторожный режим");
         sb.append(tunnelingOff ? " · тоннель выкл" : " · тоннель вкл");
         String hdmi = hdmiMode();
