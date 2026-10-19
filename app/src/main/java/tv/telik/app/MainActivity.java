@@ -96,13 +96,15 @@ public class MainActivity extends Activity {
     private static final String PAGE_URL = "https://telik.live/zhivaya-priroda.html";
     private static final String PAGE_HOST = "telik.live";
 
-    private static final long STALL_TIMEOUT_MS = 30_000;
+    private static final long STALL_TIMEOUT_MS = 12_000;
     private static final long PAGE_RETRY_MS = 5_000;
     private static final long INJECT_PERIOD_MS = 1_500;
     private static final int MAX_RETRIES_SAME_URL = 3;
 
     private static final String PREFS = "s";
     private static final String KEY_URL = "url";
+    private static final String KEY_SERVERS = "servers";
+    private static final String KEY_GOOD_HOST = "goodHost";
     private static final String KEY_HEADERS = "hdr";
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -140,7 +142,9 @@ public class MainActivity extends Activity {
     private volatile int patchedPages;
     private volatile byte[] polyfill;
     private volatile StringBuffer scrapeTrace;
-    private final List<String> altUrls = new ArrayList<>();
+    /** The same stream on different servers (e.g. tvcdnpotok.com and tvlife.live); streamUrl is one of them. */
+    private final List<String> servers = new ArrayList<>();
+    private int switchesThisRound;
     private static volatile String tlsProblem;
 
     // ---------------------------------------------------------------- lifecycle
@@ -238,6 +242,14 @@ public class MainActivity extends Activity {
                     showDiag();
                 }
                 return true;
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                // Left/Right on the remote = the same channel from the other server.
+                if (player != null && switchServer("вручную")) {
+                    if (diag.getVisibility() == View.VISIBLE) showDiag();
+                    return true;
+                }
+                return super.onKeyDown(keyCode, event);
             case KeyEvent.KEYCODE_SEARCH:
                 return true;
             default:
@@ -364,6 +376,7 @@ public class MainActivity extends Activity {
                 failCount = 0;
                 stage = "плеер: воспроизведение";
                 setPlaying(true);
+                switchesThisRound = 0;
                 if (!tunnelingOff) {
                     main.removeCallbacks(tunnelCheck);
                     main.postDelayed(tunnelCheck, 8_000);
@@ -415,11 +428,9 @@ public class MainActivity extends Activity {
             }
             failCount++;
             boolean linkRejected = isHttpRejected(error);
-            if ((linkRejected || failCount > MAX_RETRIES_SAME_URL) && !altUrls.isEmpty()) {
-                // Try the backup server of the same stream first.
-                streamUrl = altUrls.remove(0);
-                failCount = 0;
-                main.postDelayed(MainActivity.this::startPlayer, 1_000);
+            if ((linkRejected || failCount > MAX_RETRIES_SAME_URL) && canAutoSwitch()) {
+                // Try the other server of the same stream first.
+                main.postDelayed(() -> switchServer("ошибка"), 1_000);
             } else if (linkRejected || failCount > MAX_RETRIES_SAME_URL) {
                 // Link probably expired: get a fresh one from the page.
                 forgetStream(false);
@@ -430,9 +441,31 @@ public class MainActivity extends Activity {
         }
     };
 
+    /** Automatic switches go round the server list once, then fall back to fetching a fresh link. */
+    private boolean canAutoSwitch() {
+        return servers.size() > 1 && switchesThisRound < servers.size() - 1;
+    }
+
+    /** Plays the same stream from the next server in the list. */
+    private boolean switchServer(String reason) {
+        if (!started || servers.size() < 2) return false;
+        int i = servers.indexOf(streamUrl);
+        streamUrl = servers.get((i + 1) % servers.size());
+        switchesThisRound++;
+        failCount = 0;
+        noteError("сервер → " + Uri.parse(streamUrl).getHost() + " (" + reason + ")");
+        startPlayer();
+        return true;
+    }
+
     private final Runnable stallCheck = () -> {
         if (player != null && player.getPlaybackState() == Player.STATE_BUFFERING) {
             noteError("поток завис в буферизации");
+            if (canAutoSwitch()) {
+                // Slow or stuck server: move to the other one right away.
+                switchServer("тормозит");
+                return;
+            }
             failCount++;
             if (failCount > MAX_RETRIES_SAME_URL) {
                 forgetStream(false);
@@ -1012,9 +1045,16 @@ public class MainActivity extends Activity {
         // Stream servers get the same modern browser identity that the player page accepted.
         h.put("User-Agent", MODERN_UA);
         if (!started || !sniffing) return;
-        altUrls.clear();
-        for (int i = 2; i < found.length; i++) altUrls.add(found[i]);
-        onStreamFound(found[1], h);
+        servers.clear();
+        for (int i = 1; i < found.length; i++) servers.add(found[i]);
+        // Start with the server that worked best last time.
+        String first = found[1];
+        String good = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_GOOD_HOST, null);
+        if (good != null) {
+            for (String u : servers) if (good.equals(Uri.parse(u).getHost())) first = u;
+        }
+        switchesThisRound = 0;
+        onStreamFound(first, h);
     }
 
     /** Finds .m3u8 links in a page; " or "-separated backups (Playerjs style) come along too. */
@@ -1237,6 +1277,9 @@ public class MainActivity extends Activity {
                 + " · исправлено страниц: " + patchedPages
                 + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
                 + "\nПоиск в HTML: " + (scrapeTrace == null || scrapeTrace.length() == 0 ? "-" : scrapeTrace)
+                + "\nСервер: " + (streamUrl == null ? "-" : Uri.parse(streamUrl).getHost())
+                + (servers.size() > 1 ? " (" + (servers.indexOf(streamUrl) + 1) + " из " + servers.size()
+                + ", кнопки Влево/Вправо переключают)" : "")
                 + "\nВидео: " + videoInfo()
                 + "\nСсылка: " + url
                 + "\n(кнопка Menu или Вверх скрывает/показывает эту надпись)";
@@ -1251,6 +1294,9 @@ public class MainActivity extends Activity {
         SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         streamUrl = p.getString(KEY_URL, null);
         streamHeaders = decodeHeaders(p.getString(KEY_HEADERS, ""));
+        servers.clear();
+        for (String u : p.getString(KEY_SERVERS, "").split("\n")) if (!u.isEmpty()) servers.add(u);
+        if (streamUrl != null && !servers.contains(streamUrl)) servers.add(0, streamUrl);
     }
 
     private void saveCachedStream() {
@@ -1258,6 +1304,8 @@ public class MainActivity extends Activity {
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString(KEY_URL, streamUrl)
                 .putString(KEY_HEADERS, encodeHeaders(streamHeaders))
+                .putString(KEY_SERVERS, android.text.TextUtils.join("\n", servers))
+                .putString(KEY_GOOD_HOST, Uri.parse(streamUrl).getHost())
                 .apply();
     }
 
@@ -1266,8 +1314,10 @@ public class MainActivity extends Activity {
         streamUrl = null;
         streamHeaders = new HashMap<>();
         failCount = 0;
-        altUrls.clear();
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
+        servers.clear();
+        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String good = p.getString(KEY_GOOD_HOST, null);
+        p.edit().clear().putString(KEY_GOOD_HOST, good).apply();
     }
 
     private static String encodeHeaders(Map<String, String> h) {
