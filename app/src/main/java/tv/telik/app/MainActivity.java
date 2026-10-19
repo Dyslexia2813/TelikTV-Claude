@@ -145,6 +145,8 @@ public class MainActivity extends Activity {
     /** The same stream on different servers (e.g. tvcdnpotok.com and tvlife.live); streamUrl is one of them. */
     private final List<String> servers = new ArrayList<>();
     private int switchesThisRound;
+    /** Mirrors the site lists for this channel ("A or B"): same path and token on each host. */
+    private static final String[] MIRROR_HOSTS = {"tvcdnpotok.com", "tvlife.live"};
     private static volatile String tlsProblem;
 
     // ---------------------------------------------------------------- lifecycle
@@ -213,6 +215,17 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        // Left/Right first go to us, not to a focused view (the hidden page could swallow them).
+        int k = event.getKeyCode();
+        if (k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) onKeyDown(k, event);
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         switch (keyCode) {
             case KeyEvent.KEYCODE_BACK:
@@ -249,7 +262,8 @@ public class MainActivity extends Activity {
                     if (diag.getVisibility() == View.VISIBLE) showDiag();
                     return true;
                 }
-                return super.onKeyDown(keyCode, event);
+                noteError("переключение: другой сервер неизвестен (" + servers.size() + " в списке)");
+                return true;
             case KeyEvent.KEYCODE_SEARCH:
                 return true;
             default:
@@ -441,13 +455,33 @@ public class MainActivity extends Activity {
         }
     };
 
+    /**
+     * A link saved by an older version (or found alone) knows only one server: add the known mirror
+     * by swapping the host, so switching always has somewhere to go.
+     */
+    private void ensureMirrors() {
+        if (streamUrl == null) return;
+        if (!servers.contains(streamUrl)) servers.add(0, streamUrl);
+        if (servers.size() > 1) return;
+        Uri u = Uri.parse(streamUrl);
+        String host = u.getHost();
+        boolean known = false;
+        for (String h : MIRROR_HOSTS) if (h.equals(host)) known = true;
+        if (!known) return;
+        for (String h : MIRROR_HOSTS) {
+            if (!h.equals(host)) servers.add(u.buildUpon().encodedAuthority(h).build().toString());
+        }
+    }
+
     /** Automatic switches go round the server list once, then fall back to fetching a fresh link. */
     private boolean canAutoSwitch() {
+        ensureMirrors();
         return servers.size() > 1 && switchesThisRound < servers.size() - 1;
     }
 
     /** Plays the same stream from the next server in the list. */
     private boolean switchServer(String reason) {
+        ensureMirrors();
         if (!started || servers.size() < 2) return false;
         int i = servers.indexOf(streamUrl);
         streamUrl = servers.get((i + 1) % servers.size());
@@ -1055,6 +1089,7 @@ public class MainActivity extends Activity {
         }
         switchesThisRound = 0;
         onStreamFound(first, h);
+        ensureMirrors();
     }
 
     /** Finds .m3u8 links in a page; " or "-separated backups (Playerjs style) come along too. */
@@ -1242,7 +1277,10 @@ public class MainActivity extends Activity {
 
     private void noteError(String e) {
         if (e.length() > 200) e = e.substring(0, 200);
-        lastErrors.remove(e);
+        // Time stamp, so an old (already recovered) problem doesn't look current.
+        java.util.Calendar c = java.util.Calendar.getInstance();
+        e = String.format(java.util.Locale.US, "%02d:%02d ", c.get(java.util.Calendar.HOUR_OF_DAY),
+                c.get(java.util.Calendar.MINUTE)) + e;
         lastErrors.addFirst(e);
         while (lastErrors.size() > 3) lastErrors.removeLast();
         if (diag.getVisibility() == View.VISIBLE) showDiag();
@@ -1272,7 +1310,8 @@ public class MainActivity extends Activity {
                 + " · Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")"
                 + " · WebView " + chrome
                 + "\nЭтап: " + stage
-                + "\nОшибки: " + (lastErrors.isEmpty() ? "-" : android.text.TextUtils.join("\n   ", lastErrors))
+                + "\nСейчас " + String.format(java.util.Locale.US, "%tR", new java.util.Date())
+                + " · последние сбои (уже исправленные тоже): " + (lastErrors.isEmpty() ? "-" : android.text.TextUtils.join("\n   ", lastErrors))
                 + "\nПлеер сайта: " + (frameSrc.length() > 120 ? frameSrc.substring(0, 120) + "…" : frameSrc)
                 + " · исправлено страниц: " + patchedPages
                 + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
@@ -1296,7 +1335,7 @@ public class MainActivity extends Activity {
         streamHeaders = decodeHeaders(p.getString(KEY_HEADERS, ""));
         servers.clear();
         for (String u : p.getString(KEY_SERVERS, "").split("\n")) if (!u.isEmpty()) servers.add(u);
-        if (streamUrl != null && !servers.contains(streamUrl)) servers.add(0, streamUrl);
+        ensureMirrors();
     }
 
     private void saveCachedStream() {
