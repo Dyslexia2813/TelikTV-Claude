@@ -46,6 +46,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -269,15 +270,18 @@ public class MainActivity extends Activity {
                 .setBufferDurationsMs(15_000, 30_000, 2_000, 4_000)
                 .build();
 
-        // Always the best quality the stream offers, up to 1080p (the box can't output more).
-        // By default the player would limit itself to the screen size the box reports (often 720p)
-        // and start from a low quality, which looks worse than the site.
+        // Adaptive quality up to 1080p (the box can't output more): start at the best quality, step down
+        // when the network can't keep up, step back up when it can. Not limited to the screen size the box
+        // reports (often 720p even on a 4K TV).
         DefaultTrackSelector trackSelector = new DefaultTrackSelector(this);
         trackSelector.setParameters(trackSelector.buildUponParameters()
                 .clearViewportSizeConstraints()
                 .setMaxVideoSize(1920, 1080)
-                .setForceHighestSupportedBitrate(true)
                 .setExceedRendererCapabilitiesIfNecessary(true));
+        // Assume a fast connection at start so playback begins at the top quality, not the lowest.
+        DefaultBandwidthMeter bandwidth = new DefaultBandwidthMeter.Builder(this)
+                .setInitialBitrateEstimate(20_000_000L)
+                .build();
 
         // Hardware MediaCodec decoders; fall back to another decoder if the first one fails.
         DefaultRenderersFactory renderers = new DefaultRenderersFactory(this)
@@ -287,6 +291,7 @@ public class MainActivity extends Activity {
 
         player = new ExoPlayer.Builder(this, renderers, hls)
                 .setTrackSelector(trackSelector)
+                .setBandwidthMeter(bandwidth)
                 .setLoadControl(loadControl)
                 .setVideoScalingMode(C.VIDEO_SCALING_MODE_SCALE_TO_FIT)
                 .build();
