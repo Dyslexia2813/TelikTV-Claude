@@ -497,6 +497,21 @@ public class MainActivity extends Activity {
         }
     };
 
+    /** Reads a one-line system file, e.g. the Amlogic HDMI output mode ("1080p60hz"). */
+    private static String readSys(String path) {
+        try {
+            java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(path));
+            try {
+                String line = br.readLine();
+                return line == null ? null : line.trim();
+            } finally {
+                br.close();
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private static boolean isDecoderError(PlaybackException e) {
         int c = e.errorCode;
         return c == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
@@ -531,10 +546,12 @@ public class MainActivity extends Activity {
         if (bandwidth != null) sb.append(" · сеть ").append(bandwidth.getBitrateEstimate() / 1000).append(" кбит/с");
         if (strictDecoder) sb.append(" · осторожный режим");
         sb.append(tunnelingOff ? " · тоннель выкл" : " · тоннель вкл");
-        sb.append("\nЭкран: интерфейс ").append(root.getWidth()).append('x').append(root.getHeight());
+        String hdmi = readSys("/sys/class/display/mode");
+        sb.append("\nЭкран: HDMI ").append(hdmi != null ? hdmi : "?");
+        sb.append(" · интерфейс ").append(root.getWidth()).append('x').append(root.getHeight());
         if (Build.VERSION.SDK_INT >= 23) {
             android.view.Display.Mode mode = getWindowManager().getDefaultDisplay().getMode();
-            sb.append(", выход на ТВ ").append(mode.getPhysicalWidth()).append('x').append(mode.getPhysicalHeight())
+            sb.append(", Android сообщает ").append(mode.getPhysicalWidth()).append('x').append(mode.getPhysicalHeight())
                     .append(" ").append(Math.round(mode.getRefreshRate())).append("Гц");
             sb.append(" · доступно:");
             for (android.view.Display.Mode m : getWindowManager().getDefaultDisplay().getSupportedModes()) {
