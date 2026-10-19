@@ -35,6 +35,8 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
+import androidx.media3.common.Tracks;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
@@ -44,6 +46,11 @@ import androidx.media3.datasource.HttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.Renderer;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
+import androidx.media3.exoplayer.mediacodec.MediaCodecUtil;
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
+import androidx.media3.exoplayer.video.VideoRendererEventListener;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter;
@@ -113,6 +120,8 @@ public class MainActivity extends Activity {
     private ConnectivityManager.NetworkCallback netCallback;
     private boolean netLost;
     private boolean sniffing;
+    private static boolean strictDecoder;
+    private DefaultBandwidthMeter bandwidth;
     private int scrapeGen;
     private String defaultUa;
 
@@ -121,6 +130,7 @@ public class MainActivity extends Activity {
     private TextView diag;
     private boolean playingOk;
     private boolean diagHidden;
+    private boolean diagPinned; // opened by the user with the remote: stays until closed
     private long notPlayingSince;
     private String stage = "старт";
     private final LinkedList<String> lastErrors = new LinkedList<>();
@@ -214,9 +224,15 @@ public class MainActivity extends Activity {
             case KeyEvent.KEYCODE_INFO:
             case KeyEvent.KEYCODE_DPAD_UP:
                 // Show/hide the diagnostics line.
-                diagHidden = !diagHidden;
-                if (diagHidden) diag.setVisibility(View.GONE);
-                else showDiag();
+                if (diag.getVisibility() == View.VISIBLE) {
+                    diagHidden = true;
+                    diagPinned = false;
+                    diag.setVisibility(View.GONE);
+                } else {
+                    diagHidden = false;
+                    diagPinned = true;
+                    showDiag();
+                }
                 return true;
             case KeyEvent.KEYCODE_SEARCH:
                 return true;
@@ -274,18 +290,21 @@ public class MainActivity extends Activity {
         // when the network can't keep up, step back up when it can. Not limited to the screen size the box
         // reports (often 720p even on a 4K TV).
         DefaultTrackSelector trackSelector = new DefaultTrackSelector(this);
-        trackSelector.setParameters(trackSelector.buildUponParameters()
+        DefaultTrackSelector.Parameters.Builder params = trackSelector.buildUponParameters()
                 .clearViewportSizeConstraints()
-                .setMaxVideoSize(1920, 1080)
-                .setExceedRendererCapabilitiesIfNecessary(true));
-        // Assume a fast connection at start so playback begins at the top quality, not the lowest.
-        DefaultBandwidthMeter bandwidth = new DefaultBandwidthMeter.Builder(this)
-                .setInitialBitrateEstimate(20_000_000L)
+                .setExceedRendererCapabilitiesIfNecessary(true);
+        if (strictDecoder) params.setMaxVideoSize(1920, 1080);
+        else params.clearVideoSizeConstraints();
+        trackSelector.setParameters(params);
+        // Assume a very fast connection at start so playback begins at the top quality, not the lowest.
+        bandwidth = new DefaultBandwidthMeter.Builder(this)
+                .setInitialBitrateEstimate(100_000_000L)
                 .build();
 
         // Hardware MediaCodec decoders; fall back to another decoder if the first one fails.
-        DefaultRenderersFactory renderers = new DefaultRenderersFactory(this)
-                .setEnableDecoderFallback(true);
+        DefaultRenderersFactory renderers = strictDecoder
+                ? new DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+                : new TrustingRenderersFactory(this);
 
         HlsMediaSource.Factory hls = new HlsMediaSource.Factory(http).setAllowChunklessPreparation(true);
 
@@ -338,6 +357,12 @@ public class MainActivity extends Activity {
                 player.prepare();
                 return;
             }
+            if (!strictDecoder && isDecoderError(error)) {
+                // The hardware really can't do the top quality: restart with the box's own limits.
+                strictDecoder = true;
+                main.postDelayed(MainActivity.this::startPlayer, 1_000);
+                return;
+            }
             failCount++;
             boolean linkRejected = isHttpRejected(error);
             if ((linkRejected || failCount > MAX_RETRIES_SAME_URL) && !altUrls.isEmpty()) {
@@ -381,6 +406,73 @@ public class MainActivity extends Activity {
         }
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(w, h, android.view.Gravity.CENTER);
         surface.setLayoutParams(lp);
+    }
+
+    /**
+     * Cheap boxes often under-report what their hardware decoder can do (e.g. claim 1080p is "too much"),
+     * so the player silently skips the best qualities. Trust the hardware instead; if the decoder really
+     * fails, playback restarts in strict mode (see onPlayerError).
+     */
+    private static final class TrustingRenderersFactory extends DefaultRenderersFactory {
+        TrustingRenderersFactory(Context context) {
+            super(context);
+        }
+
+        @Override
+        protected void buildVideoRenderers(Context context, int extensionRendererMode,
+                MediaCodecSelector mediaCodecSelector, boolean enableDecoderFallback, Handler eventHandler,
+                VideoRendererEventListener eventListener, long allowedVideoJoiningTimeMs,
+                ArrayList<Renderer> out) {
+            out.add(new MediaCodecVideoRenderer(context, mediaCodecSelector, allowedVideoJoiningTimeMs,
+                    eventHandler, eventListener, 50) {
+                @Override
+                protected int supportsFormat(MediaCodecSelector selector, Format format)
+                        throws MediaCodecUtil.DecoderQueryException {
+                    int caps = super.supportsFormat(selector, format);
+                    // Lowest 3 bits = format support; upgrade "exceeds capabilities" to "handled".
+                    if ((caps & 0b111) == C.FORMAT_EXCEEDS_CAPABILITIES) {
+                        caps = (caps & ~0b111) | C.FORMAT_HANDLED;
+                    }
+                    return caps;
+                }
+            });
+        }
+    }
+
+    private static boolean isDecoderError(PlaybackException e) {
+        int c = e.errorCode;
+        return c == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
+                || c == PlaybackException.ERROR_CODE_DECODING_FAILED
+                || c == PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED
+                || c == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES
+                || c == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED;
+    }
+
+    /** Current picture size/bitrate and the qualities the stream offers (for the diagnostics line). */
+    private String videoInfo() {
+        if (player == null) return "-";
+        StringBuilder sb = new StringBuilder();
+        Format cur = player.getVideoFormat();
+        if (cur != null) {
+            sb.append(cur.width).append('x').append(cur.height);
+            if (cur.bitrate > 0) sb.append(' ').append(cur.bitrate / 1000).append(" кбит/с");
+        } else {
+            sb.append("-");
+        }
+        sb.append(" · варианты:");
+        for (Tracks.Group g : player.getCurrentTracks().getGroups()) {
+            if (g.getType() != C.TRACK_TYPE_VIDEO) continue;
+            for (int i = 0; i < g.length; i++) {
+                Format f = g.getTrackFormat(i);
+                sb.append(' ').append(f.height > 0 ? f.height + "p" : "?");
+                if (f.bitrate > 0) sb.append('/').append(f.bitrate / 1000);
+                if (g.isTrackSelected(i)) sb.append('*');
+                if (!g.isTrackSupported(i)) sb.append('x');
+            }
+        }
+        if (bandwidth != null) sb.append(" · сеть ").append(bandwidth.getBitrateEstimate() / 1000).append(" кбит/с");
+        if (strictDecoder) sb.append(" · осторожный режим");
+        return sb.toString();
     }
 
     private static boolean isHttpRejected(PlaybackException error) {
@@ -1014,7 +1106,7 @@ public class MainActivity extends Activity {
         playingOk = ok;
         if (ok) {
             notPlayingSince = 0;
-            diag.setVisibility(View.GONE);
+            if (!diagPinned) diag.setVisibility(View.GONE);
         } else {
             notPlayingSince = System.currentTimeMillis();
         }
@@ -1032,8 +1124,9 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (!started) return;
-            if (!playingOk && !diagHidden && notPlayingSince != 0
-                    && System.currentTimeMillis() - notPlayingSince > DIAG_DELAY_MS) {
+            if (diag.getVisibility() == View.VISIBLE
+                    || (!playingOk && !diagHidden && notPlayingSince != 0
+                    && System.currentTimeMillis() - notPlayingSince > DIAG_DELAY_MS)) {
                 showDiag();
             }
             main.postDelayed(this, 3_000);
@@ -1056,6 +1149,7 @@ public class MainActivity extends Activity {
                 + " · исправлено страниц: " + patchedPages
                 + (tlsProblem != null ? "\nСертификат: " + tlsProblem : "")
                 + "\nПоиск в HTML: " + (scrapeTrace == null || scrapeTrace.length() == 0 ? "-" : scrapeTrace)
+                + "\nВидео: " + videoInfo()
                 + "\nСсылка: " + url
                 + "\n(кнопка Menu или Вверх скрывает/показывает эту надпись)";
         diag.setText(text);
