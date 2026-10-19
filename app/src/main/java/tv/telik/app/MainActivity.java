@@ -715,6 +715,17 @@ public class MainActivity extends Activity {
         if (cookie != null) c.setRequestProperty("Cookie", cookie);
 
         int code = c.getResponseCode();
+        if (code == 401 || code == 403) {
+            c.disconnect();
+            String referer = null;
+            String ua = null;
+            if (reqHeaders != null) for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+                if ("referer".equalsIgnoreCase(e.getKey())) referer = e.getValue();
+                if ("user-agent".equalsIgnoreCase(e.getKey())) ua = e.getValue();
+            }
+            c = openLikeBrowser(url, referer, ua, false);
+            code = c.getResponseCode();
+        }
         String type = c.getContentType();
         if (code != 200 || type == null || !type.toLowerCase().contains("text/html")) {
             // Redirects, errors and non-HTML are left to the WebView itself.
@@ -809,7 +820,8 @@ public class MainActivity extends Activity {
         h.put("Referer", found[0]);
         Uri r = Uri.parse(found[0]);
         h.put("Origin", r.getScheme() + "://" + r.getHost());
-        if (ua != null) h.put("User-Agent", ua);
+        // Stream servers get the same modern browser identity that the player page accepted.
+        h.put("User-Agent", MODERN_UA);
         if (!started || !sniffing) return;
         altUrls.clear();
         for (int i = 2; i < found.length; i++) altUrls.add(found[i]);
@@ -885,15 +897,57 @@ public class MainActivity extends Activity {
         return new URL(new URL(base), url).toString();
     }
 
-    private static String fetch(String url, String referer, String ua) throws Exception {
-        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        try {
+    /** A current desktop Chrome: the player server answers 403 to the box's 2016 browser. */
+    private static final String MODERN_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+    /**
+     * Opens a page, trying progressively more "real browser" request headers if the server says 401/403.
+     * variant 0: as given; 1: modern Chrome as an iframe with origin referer; 2: same with full referer.
+     */
+    private HttpURLConnection openLikeBrowser(String url, String referer, String ua, boolean followRedirects)
+            throws Exception {
+        HttpURLConnection c = null;
+        for (int v = 0; v < 3; v++) {
+            if (v > 0 && referer == null) break;
+            c = (HttpURLConnection) new URL(url).openConnection();
             c.setConnectTimeout(10_000);
-            c.setReadTimeout(10_000);
-            c.setInstanceFollowRedirects(true);
-            if (ua != null) c.setRequestProperty("User-Agent", ua);
-            if (referer != null) c.setRequestProperty("Referer", referer);
-            c.setRequestProperty("Accept", "text/html,*/*");
+            c.setReadTimeout(15_000);
+            c.setInstanceFollowRedirects(followRedirects);
+            if (v == 0) {
+                if (ua != null) c.setRequestProperty("User-Agent", ua);
+                if (referer != null) c.setRequestProperty("Referer", referer);
+                c.setRequestProperty("Accept", "text/html,*/*");
+            } else {
+                Uri ref = Uri.parse(referer);
+                c.setRequestProperty("User-Agent", MODERN_UA);
+                c.setRequestProperty("Referer", v == 1 ? ref.getScheme() + "://" + ref.getHost() + "/" : referer);
+                c.setRequestProperty("Accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
+                c.setRequestProperty("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8");
+                c.setRequestProperty("Upgrade-Insecure-Requests", "1");
+                c.setRequestProperty("Sec-Fetch-Dest", "iframe");
+                c.setRequestProperty("Sec-Fetch-Mode", "navigate");
+                c.setRequestProperty("Sec-Fetch-Site", "cross-site");
+                c.setRequestProperty("Sec-Ch-Ua", "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"");
+                c.setRequestProperty("Sec-Ch-Ua-Mobile", "?0");
+                c.setRequestProperty("Sec-Ch-Ua-Platform", "\"Windows\"");
+            }
+            String cookie = CookieManager.getInstance().getCookie(url);
+            if (cookie != null) c.setRequestProperty("Cookie", cookie);
+            int code = c.getResponseCode();
+            if (code != 401 && code != 403) {
+                if (v > 0) trace("вход как Chrome/" + v);
+                return c;
+            }
+            if (v < 2) c.disconnect();
+        }
+        return c;
+    }
+
+    private String fetch(String url, String referer, String ua) throws Exception {
+        HttpURLConnection c = openLikeBrowser(url, referer, ua, true);
+        try {
             int code = c.getResponseCode();
             if (code >= 400) throw new java.io.IOException("HTTP " + code + " " + url);
             InputStream in = c.getInputStream();
