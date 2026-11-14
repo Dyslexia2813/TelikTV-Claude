@@ -24,16 +24,19 @@ jobs:
       - name: Build release APK
         run: ./gradlew --no-daemon assembleRelease
 
+      # The APK and artifact names carry the app version, so builds are never confused.
       - name: Rename APK
         run: |
+          VERSION=$(sed -n "s/.*versionName '\(.*\)'.*/\1/p" app/build.gradle)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           mkdir -p out
-          cp app/build/outputs/apk/release/app-release.apk out/TelikTV.apk
+          cp app/build/outputs/apk/release/app-release.apk "out/TelikTV-$VERSION.apk"
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TelikTV-apk
-          path: out/TelikTV.apk
+          name: TelikTV-apk-${{ env.VERSION }}
+          path: out/TelikTV-${{ env.VERSION }}.apk
 
       # Tag a version (git tag v1.0 && git push --tags) to get a GitHub Release
       # with a direct APK download link.
@@ -41,4 +44,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/TelikTV.apk
+          files: out/TelikTV-${{ env.VERSION }}.apk
